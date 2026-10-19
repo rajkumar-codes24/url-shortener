@@ -21,8 +21,19 @@ public class ShortenedUrl {
 
     @Column(name = "original_url", nullable = false, length = 2048)
     private String originalUrl;
+    
+    @Column(name = "original_url_hash", nullable = false, length = 64, unique = true)
+    private String originalUrlHash;
 
-    @Column(name = "short_code", nullable = false, unique = true, length = 20)
+    public String getOriginalUrlHash() {
+		return originalUrlHash;
+	}
+
+	public void setOriginalUrlHash(String originalUrlHash) {
+		this.originalUrlHash = originalUrlHash;
+	}
+
+	@Column(name = "short_code", nullable = false, unique = true, length = 20)
     private String shortCode;
 
     @Column(name = "created_at", nullable = false, updatable = false)

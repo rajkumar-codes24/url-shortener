@@ -15,7 +15,7 @@ import com.proj.service.UrlService;
 import jakarta.validation.Valid;
 
 
-@CrossOrigin(value = "https://url-shortener-frontend-wine-theta.vercel.app/")
+@CrossOrigin(value = "https:url-shortener-frontend-wine-theta.vercel.app/")
 @RestController
 @RequestMapping(value = "/api")
 public class UrlController {
@@ -29,7 +29,6 @@ public class UrlController {
 	@PostMapping(value = "/getShortURL")
 	  public ResponseEntity<ShortenUrlResponse> createShortURL(@RequestBody @Valid ShortenUrlRequest request){ 
 		
-		  System.out.println("UrlController.createShortURL()");
 		  
 		  ShortenUrlResponse shortenUrlResponse = service.registerUrl(request);
 		  

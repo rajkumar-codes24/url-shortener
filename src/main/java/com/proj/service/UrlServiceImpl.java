@@ -10,6 +10,7 @@ import java.util.Optional;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
@@ -24,173 +25,165 @@ import com.proj.urlvalidation.UrlValidator;
 @Service
 public class UrlServiceImpl implements UrlService {
 
-	private static final Duration CACHE_TTL = Duration.ofHours(24);
+    private static final Duration CACHE_TTL = Duration.ofHours(24);
 
-	@Value("${app.base-url}")
-	private String baseURL;
+    @Value("${app.base-url}")
+    private String baseURL;
 
-	private final UrlRepository repository;
-	private final UrlValidator validator;
-	private final StringRedisTemplate redisTemplate;
+    private final UrlRepository repository;
+    private final UrlValidator validator;
+    private final StringRedisTemplate redisTemplate;
 
-	public UrlServiceImpl(UrlRepository repository, UrlValidator validator, StringRedisTemplate redisTemplate) {
+    public UrlServiceImpl(
+            UrlRepository repository,
+            UrlValidator validator,
+            StringRedisTemplate redisTemplate) {
 
-		this.repository = repository;
-		this.validator = validator;
-		this.redisTemplate = redisTemplate;
-	}
+        this.repository = repository;
+        this.validator = validator;
+        this.redisTemplate = redisTemplate;
+    }
 
-	@Override
-	public ShortenUrlResponse registerUrl(ShortenUrlRequest request) {
+    @Override
+    public ShortenUrlResponse registerUrl(ShortenUrlRequest request) {
 
-		System.out.println("UrlServiceImpl.registerUrl()");
+        String originalUrl = request.getOriginalUrl();
+        validator.validate(originalUrl);
 
-		String originalUrl = request.getOriginalUrl();
-		validator.validate(originalUrl);
+        String originalUrlHash = hashOriginalUrl(originalUrl);
+        String cacheKey = "url:original:" + originalUrlHash;
 
-		// 1. Create a Redis key for this original URL.
-		String cacheKey = createCacheKey(originalUrl);
+        String cachedCode = getCachedCode(cacheKey);
 
-		// 2. Try Redis first.
-		String cachedCode = getCachedCode(cacheKey);
+        if (cachedCode != null) {
+            return createResponse(originalUrl, cachedCode);
+        }
 
-		if (cachedCode != null) {
-			return createResponse(originalUrl, cachedCode);
-		}
+        Optional<ShortenedUrl> existing =
+                repository.findByOriginalUrlHash(originalUrlHash);
 
-		// 3. Redis miss: check MySQL.
-		Optional<ShortenedUrl> existing = repository.findFirstByOriginalUrlOrderByCreatedAtAsc(originalUrl);
+        if (existing.isPresent()) {
+            String existingCode = existing.get().getShortCode();
+            cacheCode(cacheKey, existingCode);
+            return createResponse(originalUrl, existingCode);
+        }
 
-		if (existing.isPresent()) {
-			String existingCode = existing.get().getShortCode();
+        String shortCode;
 
-			// Warm the cache for the next request.
-			cacheCode(cacheKey, existingCode);
+        do {
+            shortCode = RandomString.getAlphaNumericString();
+        } while (repository.existsByShortCode(shortCode));
 
-			return createResponse(originalUrl, existingCode);
-		}
+        ShortenedUrl url = new ShortenedUrl();
+        url.setOriginalUrl(originalUrl);
+        url.setOriginalUrlHash(originalUrlHash);
+        url.setShortCode(shortCode);
+        url.setExpiresAt(null);
+        url.setClickCount(0L);
 
-		// 4. No existing URL: generate a unique short code.
-		String shortCode;
+        try {
+            repository.saveAndFlush(url);
 
-		do {
-			shortCode = RandomString.getAlphaNumericString();
-		} while (repository.existsByShortCode(shortCode));
+        } catch (DataIntegrityViolationException ex) {
 
-		ShortenedUrl url = new ShortenedUrl();
-		url.setOriginalUrl(originalUrl);
-		url.setShortCode(shortCode);
-		url.setExpiresAt(null);
-		url.setClickCount(0L);
+            Optional<ShortenedUrl> existingUrl =
+                    repository.findByOriginalUrlHash(originalUrlHash);
 
-		// 5. Persist first; cache only after successful save.
-		repository.save(url);
+            if (existingUrl.isPresent()) {
+                String existingCode = existingUrl.get().getShortCode();
+                cacheCode(cacheKey, existingCode);
+                return createResponse(originalUrl, existingCode);
+            }
 
-		cacheCode(cacheKey, shortCode);
+            throw ex;
+        }
 
-		return createResponse(originalUrl, shortCode);
-	}
+        cacheCode(cacheKey, shortCode);
 
-	@Override
-	public String getOriginalUrl(String shortCode) {
+        return createResponse(originalUrl, shortCode);
+    }
 
-		// 1. Build the Redis key for this short code.
-		String cacheKey = "url:code:" + shortCode;
+    @Override
+    public String getOriginalUrl(String shortCode) {
 
-		// 2. Check Redis first.
-		String cachedOriginalUrl = getCachedOriginalUrl(cacheKey);
+        String cacheKey = "url:code:" + shortCode;
 
-		if (cachedOriginalUrl != null) {
-			System.out.println("REDIRECT CACHE HIT: " + cacheKey);
-			return cachedOriginalUrl;
-		}
+        String cachedOriginalUrl = getCachedOriginalUrl(cacheKey);
 
-		System.out.println("REDIRECT CACHE MISS: " + cacheKey);
+        if (cachedOriginalUrl != null) {
+            return cachedOriginalUrl;
+        }
 
-		// 3. Cache miss: look up the short code in MySQL.
-		Optional<ShortenedUrl> optional = repository.findByShortCode(shortCode);
+        Optional<ShortenedUrl> optional =
+                repository.findByShortCode(shortCode);
 
-		if (optional.isPresent()) {
+        if (optional.isPresent()) {
+            String originalUrl = optional.get().getOriginalUrl();
+            cacheOriginalUrl(cacheKey, originalUrl);
+            return originalUrl;
+        }
 
-			String originalUrl = optional.get().getOriginalUrl();
+        throw new UrlNotFoundException(
+                "URL not found for the shortcode");
+    }
 
-			// 4. Cache the result for future redirects.
-			cacheOriginalUrl(cacheKey, originalUrl);
+    private String getCachedCode(String cacheKey) {
+        try {
+            return redisTemplate.opsForValue().get(cacheKey);
+        } catch (DataAccessException ex) {
+            return null;
+        }
+    }
 
-			return originalUrl;
-		}
+    private void cacheCode(String cacheKey, String shortCode) {
+        try {
+            redisTemplate.opsForValue().set(
+                    cacheKey, shortCode, CACHE_TTL);
+        } catch (DataAccessException ex) {
+            // Redis failure must not prevent URL creation.
+        }
+    }
 
-		// 5. Neither Redis nor MySQL has this short code.
-		throw new UrlNotFoundException("URL not found for the shortcode");
-	}
+    private String getCachedOriginalUrl(String cacheKey) {
+        try {
+            return redisTemplate.opsForValue().get(cacheKey);
+        } catch (DataAccessException ex) {
+            return null;
+        }
+    }
 
-	private String getCachedOriginalUrl(String cacheKey) {
-		try {
-			return redisTemplate.opsForValue().get(cacheKey);
-		} catch (DataAccessException ex) {
-			// Redis unavailable: fall back to MySQL.
-			return null;
-		}
-	}
+    private void cacheOriginalUrl(
+            String cacheKey, String originalUrl) {
+        try {
+            redisTemplate.opsForValue().set(
+                    cacheKey, originalUrl, CACHE_TTL);
+        } catch (DataAccessException ex) {
+            // Redis failure must not prevent redirects.
+        }
+    }
 
-	private void cacheOriginalUrl(String cacheKey, String originalUrl) {
-		try {
-			redisTemplate.opsForValue().set(cacheKey, originalUrl, CACHE_TTL);
-		} catch (DataAccessException ex) {
-			// Redirects should still work if Redis is unavailable.
-		}
-	}
+    private String hashOriginalUrl(String originalUrl) {
+        try {
+            MessageDigest digest =
+                    MessageDigest.getInstance("SHA-256");
 
-	private String getCachedCode(String cacheKey) {
+            byte[] hash = digest.digest(
+                    originalUrl.getBytes(StandardCharsets.UTF_8));
 
-		System.out.println("UrlServiceImpl.getCachedCode()");
-		try {
-			String cachedCode = redisTemplate.opsForValue().get(cacheKey);
+            return HexFormat.of().formatHex(hash);
 
-			if (cachedCode != null) {
-				System.out.println("REDIS CACHE HIT: " + cacheKey);
-			} else {
-				System.out.println("REDIS CACHE MISS: " + cacheKey);
-			}
+        } catch (NoSuchAlgorithmException ex) {
+            throw new IllegalStateException(
+                    "SHA-256 is not available", ex);
+        }
+    }
 
-			return cachedCode;
-		} catch (DataAccessException ex) {
-			System.out.println("REDIS UNAVAILABLE: " + ex.getMessage());
-			return null;
-		}
-	}
+    private ShortenUrlResponse createResponse(
+            String originalUrl, String shortCode) {
 
-	private void cacheCode(String cacheKey, String shortCode) {
+        String shortUrl = baseURL + shortCode;
 
-		System.out.println("UrlServiceImpl.cacheCode()");
-		try {
-			redisTemplate.opsForValue().set(cacheKey, shortCode, CACHE_TTL);
-		} catch (DataAccessException ex) {
-			// Saving in MySQL must not fail just because
-			// Redis could not be updated.
-		}
-	}
-
-	private String createCacheKey(String originalUrl) {
-
-		System.out.println("UrlServiceImpl.createCacheKey()");
-
-		try {
-			MessageDigest digest = MessageDigest.getInstance("SHA-256");
-
-			byte[] hash = digest.digest(originalUrl.getBytes(StandardCharsets.UTF_8));
-
-			return "url:original:" + HexFormat.of().formatHex(hash);
-
-		} catch (NoSuchAlgorithmException ex) {
-			throw new IllegalStateException("SHA-256 is not available", ex);
-		}
-	}
-
-	private ShortenUrlResponse createResponse(String originalUrl, String shortCode) {
-
-		String shortUrl = baseURL + shortCode;
-
-		return new ShortenUrlResponse(originalUrl, shortCode, shortUrl);
-	}
+        return new ShortenUrlResponse(
+                originalUrl, shortCode, shortUrl);
+    }
 }
