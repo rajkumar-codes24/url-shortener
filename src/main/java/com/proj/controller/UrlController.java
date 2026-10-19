@@ -15,7 +15,7 @@ import com.proj.service.UrlService;
 import jakarta.validation.Valid;
 
 
-@CrossOrigin(value = "https:url-shortener-frontend-wine-theta.vercel.app/")
+@CrossOrigin(value = "https://url-shortener-frontend-wine-theta.vercel.app/")
 @RestController
 @RequestMapping(value = "/api")
 public class UrlController {
